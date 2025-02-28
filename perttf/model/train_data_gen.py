@@ -1,28 +1,56 @@
-from typing import List, Tuple, Dict, Union, Optional, Literal
 import random
-import torch
+from typing import Dict, Literal, Optional, Tuple
+
 import numpy as np
-from torch import nn, Tensor
-from torch.utils.data import Dataset, DataLoader
-
-from scipy.sparse import issparse
-
+import torch
 from anndata import AnnData
+from scipy.sparse import issparse
 from sklearn.model_selection import train_test_split
-
-from torchtext.vocab import Vocab
+from sklearn.preprocessing import KBinsDiscretizer
+from torch.utils.data import DataLoader, Dataset
 from torchtext._torchtext import (
     Vocab as VocabPybind,
 )
+from torchtext.vocab import Vocab
 
 import scgpt as scg
-from scgpt.tokenizer import tokenize_and_pad_batch, random_mask_value
 from scgpt import SubsetsBatchSampler
+from scgpt.tokenizer import random_mask_value, tokenize_and_pad_batch
 
-def add_pred_layer(adata: AnnData, 
-        binned_layer_key: Optional[str] = 'X_binned', 
-        next_layer_key: Optional[str] = 'X_binned_next',
-        next_cell_pred: Literal["identity","pert"] = "identity") -> Dict:
+
+def bin_expression(expression_matrix, n_bins=30, strategy="uniform"):
+    """
+    Convert continuous expression values to discrete bins
+
+    Args:
+        expression_matrix (np.ndarray or scipy.sparse): Raw expression matrix
+        n_bins (int): Number of bins to use
+        strategy (str): Binning strategy ('uniform', 'quantile', 'kmeans')
+
+    Returns:
+        np.ndarray: Binned expression matrix
+    """
+    if issparse(expression_matrix):
+        expression_matrix = expression_matrix.toarray()
+
+    # Initialize discretizer
+    discretizer = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy=strategy)
+
+    # Apply binning
+    binned_data = discretizer.fit_transform(expression_matrix)
+
+    # Normalize to [0, 1]
+    binned_data = binned_data / (n_bins - 1)
+
+    return binned_data
+
+
+def add_pred_layer(
+    adata: AnnData,
+    binned_layer_key: Optional[str] = "X_binned",
+    next_layer_key: Optional[str] = "X_binned_next",
+    next_cell_pred: Literal["identity", "pert"] = "identity",
+) -> Dict:
     """
     format controls the different input value wrapping, including categorical
     binned style, fixed-sum normalized counts, log1p fixed-sum normalized counts, etc.
@@ -40,45 +68,54 @@ def add_pred_layer(adata: AnnData,
     """
     # right now, just a duplicate of input layers
     if next_cell_pred == "identity":
-        input_layers=adata.layers[binned_layer_key].copy()
-        return input_layers,adata
+        input_layers = adata.layers[binned_layer_key].copy()
+        return input_layers, adata
     # store the data
 
-    obsf=adata.obs
+    adata.layers[binned_layer_key] = bin_expression(adata.X)
+
+    obsf = adata.obs
     next_cell_dict = {}
-    genotype_pool = list(set(obsf['genotype']))
-    for candidate_celltype in set(obsf['celltype']):
+    genotype_pool = list(set(obsf["genotype"]))
+    for candidate_celltype in set(obsf["celltype"]):
         next_cell_dict[candidate_celltype] = {}
-        for candidate_genotype in set(obsf['genotype']):
-            obsf_sel = obsf[(obsf['celltype']==candidate_celltype) & (obsf['genotype']==candidate_genotype)]
+        for candidate_genotype in set(obsf["genotype"]):
+            obsf_sel = obsf[
+                (obsf["celltype"] == candidate_celltype)
+                & (obsf["genotype"] == candidate_genotype)
+            ]
             included_cells = obsf_sel.index.to_list()
             if len(included_cells) > 0:
                 next_cell_dict[candidate_celltype][candidate_genotype] = included_cells
 
-    adata_p = adata[adata.obs['genotype']=='WT']
+    adata_p = adata[adata.obs["genotype"] == "WT"]
 
-    target_pert=[]
-    target_cell_id=[]
+    target_pert = []
+    target_cell_id = []
 
     for this_cell in adata_p.obs.index.values:
-        this_cell_type = adata_p.obs.loc[this_cell]['celltype']
-        next_pert_value=random.choice(list(next_cell_dict[this_cell_type].keys()))
+        this_cell_type = adata_p.obs.loc[this_cell]["celltype"]
+        next_pert_value = random.choice(list(next_cell_dict[this_cell_type].keys()))
         target_pert.append(next_pert_value)
         next_cell = random.choice(next_cell_dict[this_cell_type][next_pert_value])
         target_cell_id.append(next_cell)
 
-    adata_p.obs['genotype'] = target_pert
-    adata_p.obs['next_cell_id'] = target_cell_id
+    adata_p.obs["genotype"] = target_pert
+    adata_p.obs["next_cell_id"] = target_cell_id
 
-    input_layers=adata.layers[binned_layer_key].copy()
+    input_layers = adata.layers[binned_layer_key].copy()
 
-    target_cell_id_index=obsf.index.get_indexer(target_cell_id)
-    target_layers=input_layers[target_cell_id_index]
+    target_cell_id_index = obsf.index.get_indexer(target_cell_id)
+    target_layers = input_layers[target_cell_id_index]
 
-    return target_layers,adata_p
+    return target_layers, adata_p
 
 
-def add_pred_layer_old(adata: AnnData, binned_layer_key: Optional[str] = 'X_binned', next_layer_key: Optional[str] = 'X_binned_next') -> Dict:
+def add_pred_layer_old(
+    adata: AnnData,
+    binned_layer_key: Optional[str] = "X_binned",
+    next_layer_key: Optional[str] = "X_binned_next",
+) -> Dict:
     """
     format controls the different input value wrapping, including categorical
     binned style, fixed-sum normalized counts, log1p fixed-sum normalized counts, etc.
@@ -94,38 +131,57 @@ def add_pred_layer_old(adata: AnnData, binned_layer_key: Optional[str] = 'X_binn
     """
 
     # right now, just a duplicate of input layers
-    input_layers=adata.layers[binned_layer_key].copy()
-    return input_layers,adata
+    input_layers = adata.layers[binned_layer_key].copy()
+    return input_layers, adata
 
-    n_bin_pseudotome=5 # split pseudotime bins
+    n_bin_pseudotome = 5  # split pseudotime bins
 
-    obsf=adata.obs
+    obsf = adata.obs
     import pandas as pd
-    obsf['pseudotime_bin'] = pd.cut(obsf['palantir_pseudotime'], bins=np.linspace(0, 1, num=n_bin_pseudotome), labels=False) # split [0,1] into n bins and calculate bin number for palantir_pseudotime column
 
-    p_prob=adata.obsm['palantir_fate_probabilities']
-    n_diff_cell_types=p_prob.shape[1]
-    p_prob['max_index'] = np.argmax(p_prob.values, axis=1) # find the index with the largest value for each row
+    obsf["pseudotime_bin"] = pd.cut(
+        obsf["palantir_pseudotime"],
+        bins=np.linspace(0, 1, num=n_bin_pseudotome),
+        labels=False,
+    )  # split [0,1] into n bins and calculate bin number for palantir_pseudotime column
 
-    obsf_2=obsf[['palantir_pseudotime','palantir_entropy','pseudotime_bin']].join(p_prob)
+    p_prob = adata.obsm["palantir_fate_probabilities"]
+    n_diff_cell_types = p_prob.shape[1]
+    p_prob["max_index"] = np.argmax(
+        p_prob.values, axis=1
+    )  # find the index with the largest value for each row
 
-    target_cell_id=[]
-    is_valid_next=[]
+    obsf_2 = obsf[["palantir_pseudotime", "palantir_entropy", "pseudotime_bin"]].join(
+        p_prob
+    )
+
+    target_cell_id = []
+    is_valid_next = []
     n_no_next = 0
     for this_cell in obsf_2.index.values:
-        t_ps_bin=obsf_2['pseudotime_bin'].loc[this_cell]
-        t_max_index=obsf_2['max_index'].loc[this_cell]
-        t_entrophy=obsf_2['palantir_entropy'].loc[this_cell]
-        cell_pool=[]
-        if t_ps_bin == 0: # pseudo-time =0; can be any cell in the next bin
+        t_ps_bin = obsf_2["pseudotime_bin"].loc[this_cell]
+        t_max_index = obsf_2["max_index"].loc[this_cell]
+        t_entrophy = obsf_2["palantir_entropy"].loc[this_cell]
+        cell_pool = []
+        if t_ps_bin == 0:  # pseudo-time =0; can be any cell in the next bin
             # cell_pool=obsf_2.index.values[obsf_2['pseudotime_bin'] == t_ps_bin+1 & (obsf_2['palantir_entropy'] < t_entrophy) ]
-            cell_pool=obsf_2.index.values[obsf_2['pseudotime_bin'] == t_ps_bin+1  ]  # do not use entrophy
-        elif t_ps_bin == n_bin_pseudotome - 2: # pseudo-time =last bin; can be any cell in the current bin with the same fate
-            #cell_pool=obsf_2.index.values[ (obsf_2['pseudotime_bin'] == t_ps_bin) & (obsf_2['max_index']==t_max_index) & (obsf_2['palantir_entropy'] < t_entrophy)]
-            cell_pool=obsf_2.index.values[ (obsf_2['pseudotime_bin'] == t_ps_bin) & (obsf_2['max_index']==t_max_index) ]
+            cell_pool = obsf_2.index.values[
+                obsf_2["pseudotime_bin"] == t_ps_bin + 1
+            ]  # do not use entrophy
+        elif (
+            t_ps_bin == n_bin_pseudotome - 2
+        ):  # pseudo-time =last bin; can be any cell in the current bin with the same fate
+            # cell_pool=obsf_2.index.values[ (obsf_2['pseudotime_bin'] == t_ps_bin) & (obsf_2['max_index']==t_max_index) & (obsf_2['palantir_entropy'] < t_entrophy)]
+            cell_pool = obsf_2.index.values[
+                (obsf_2["pseudotime_bin"] == t_ps_bin)
+                & (obsf_2["max_index"] == t_max_index)
+            ]
         else:
-            #cell_pool=obsf_2.index.values[ (obsf_2['pseudotime_bin'] == t_ps_bin+1) & (obsf_2['max_index']==t_max_index) & (obsf_2['palantir_entropy'] < t_entrophy)]
-            cell_pool=obsf_2.index.values[ (obsf_2['pseudotime_bin'] == t_ps_bin+1) & (obsf_2['max_index']==t_max_index)]
+            # cell_pool=obsf_2.index.values[ (obsf_2['pseudotime_bin'] == t_ps_bin+1) & (obsf_2['max_index']==t_max_index) & (obsf_2['palantir_entropy'] < t_entrophy)]
+            cell_pool = obsf_2.index.values[
+                (obsf_2["pseudotime_bin"] == t_ps_bin + 1)
+                & (obsf_2["max_index"] == t_max_index)
+            ]
         if len(cell_pool) > 0:
             target_cell_id.append(random.choice(cell_pool))
             is_valid_next.append(True)
@@ -134,31 +190,30 @@ def add_pred_layer_old(adata: AnnData, binned_layer_key: Optional[str] = 'X_binn
             n_no_next = n_no_next + 1
             is_valid_next.append(False)
 
-    adata.obs['next_cell_id'] = target_cell_id
-    adata.obs['is_valid_next'] = is_valid_next
+    adata.obs["next_cell_id"] = target_cell_id
+    adata.obs["is_valid_next"] = is_valid_next
 
-    input_layers=adata.layers[binned_layer_key].copy()
-    target_cell_id_index=obsf_2.index.get_indexer(target_cell_id)
-    target_layers=input_layers[target_cell_id_index]
+    input_layers = adata.layers[binned_layer_key].copy()
+    target_cell_id_index = obsf_2.index.get_indexer(target_cell_id)
+    target_layers = input_layers[target_cell_id_index]
 
-    #adata.layers[next_layer_key]=target_layers
-
+    # adata.layers[next_layer_key]=target_layers
 
     return target_layers
 
 
-
-
-
-def produce_training_datasets(adata_input, config,
-                              input_layer_key = "X_binned",
-                              next_layer_key = "X_binned_next",
-                              next_cell_pred: Literal["identity","pert"] = "identity",
-                              cell_type_to_index = None,
-                              genotype_to_index = None,
-                              logger = scg.logger):
+def produce_training_datasets(
+    adata_input,
+    config,
+    input_layer_key="X_binned",
+    next_layer_key="X_binned_next",
+    next_cell_pred: Literal["identity", "pert"] = "identity",
+    cell_type_to_index=None,
+    genotype_to_index=None,
+    logger=scg.logger,
+):
     """
-    produce training datasets for from scRNA-seq 
+    produce training datasets for from scRNA-seq
     Args:
 
     adata_input (:class:`AnnData`):
@@ -170,24 +225,26 @@ def produce_training_datasets(adata_input, config,
     next_cell_pred:
         Whether to generate next cell fate prediction. Default is "identity" (simply duplicating input_layer_key).
     """
-                                  
+
     # add necessary columns to adata
     adata_input.var["gene_name"] = adata_input.var.index.tolist()
 
     # set up these random values such that they don't get errors later on during training
     adata_input.obs["str_batch"] = adata_input.obs["batch"]
     adata_input.obs["str_batch"] = adata_input.obs["str_batch"].astype(str)
-    adata_input.obs["batch_id"] = adata_input.obs["str_batch"].astype("category").cat.codes.values
-    #adata.obs["celltype"] = random.choices( [0,1], k=adata.shape[0])
-    #adata.obs["celltype"] = adata.obs["celltype"].astype("category")
+    adata_input.obs["batch_id"] = (
+        adata_input.obs["str_batch"].astype("category").cat.codes.values
+    )
+    # adata.obs["celltype"] = random.choices( [0,1], k=adata.shape[0])
+    # adata.obs["celltype"] = adata.obs["celltype"].astype("category")
 
     # further expand the next layer prediction
-    n_rounds = config.n_rounds if hasattr(config,"n_rounds") else 1
+    n_rounds = config.n_rounds if hasattr(config, "n_rounds") else 1
     adata = None
     genes = None
     next_counts = None
     all_counts = None
-    celltypes_labels = None 
+    celltypes_labels = None
     perturbation_labels = None
     batch_ids = None
     num_batch_types = -1
@@ -195,57 +252,76 @@ def produce_training_datasets(adata_input, config,
     perturbation_indexes = None
     batch_indexes = None
     cell_ids = None
-    index_rounds=None
+    index_rounds = None
 
     if cell_type_to_index is None:
-        cell_type_to_index = {cell_type: index for index, cell_type in enumerate(set(adata_input.obs["celltype"].tolist()))}
+        cell_type_to_index = {
+            cell_type: index
+            for index, cell_type in enumerate(set(adata_input.obs["celltype"].tolist()))
+        }
 
     if genotype_to_index is None:
-        genotype_to_index = {genotype: index for index, genotype in enumerate(set(adata_input.obs["genotype"].tolist()))}
+        genotype_to_index = {
+            genotype: index
+            for index, genotype in enumerate(set(adata_input.obs["genotype"].tolist()))
+        }
 
     n_cls = len(cell_type_to_index)
     n_perturb = len(genotype_to_index)
 
     for ni in range(n_rounds):
         # predict the next state of a cell
-        next_counts_0,adata_0 = add_pred_layer(adata_input,next_cell_pred=next_cell_pred)
-        all_counts_0 = (adata_0.layers[input_layer_key].A if issparse(adata_0.layers[input_layer_key]) else adata_0.layers[input_layer_key])
+        next_counts_0, adata_0 = add_pred_layer(
+            adata_input, next_cell_pred=next_cell_pred
+        )
+        all_counts_0 = (
+            adata_0.layers[input_layer_key].A
+            if issparse(adata_0.layers[input_layer_key])
+            else adata_0.layers[input_layer_key]
+        )
 
         if "celltype" in adata_0.obs.columns:
-            celltypes_labels_0 = adata_0.obs["celltype"].tolist()  # make sure count from 0
+            celltypes_labels_0 = adata_0.obs[
+                "celltype"
+            ].tolist()  # make sure count from 0
         else:
-            celltypes_labels_0 = random.choices( [0,1], k=adata_0.shape[0])
-        #num_types = len(set(celltypes_labels))
+            celltypes_labels_0 = random.choices([0, 1], k=adata_0.shape[0])
+        # num_types = len(set(celltypes_labels))
         celltypes_labels_0 = np.array(celltypes_labels_0)
 
         if "genotype" in adata_0.obs.columns:
-            perturbation_labels_0 = adata_0.obs["genotype"].tolist()  # make sure count from 0
+            perturbation_labels_0 = adata_0.obs[
+                "genotype"
+            ].tolist()  # make sure count from 0
         else:
-            perturbation_labels_0 = random.choices( [0,1], k=adata_0.shape[0])
+            perturbation_labels_0 = random.choices([0, 1], k=adata_0.shape[0])
         perturbation_labels_0 = np.array(perturbation_labels_0)
 
-        if "batch_id" in adata_0.obs.columns: # and config.DSBN:
+        if "batch_id" in adata_0.obs.columns:  # and config.DSBN:
             batch_ids_0 = adata_0.obs["batch_id"].tolist()
         else:
-            batch_ids_0=random.choices( [0,1], k=adata_0.shape[0])
+            batch_ids_0 = random.choices([0, 1], k=adata_0.shape[0])
         batch_ids_0 = np.array(batch_ids_0)
 
         # generate cell type indexs and perturbation indexes
 
-
-        celltypes_indexes_0 = [cell_type_to_index[cell_type] for cell_type in celltypes_labels_0]
+        celltypes_indexes_0 = [
+            cell_type_to_index[cell_type] for cell_type in celltypes_labels_0
+        ]
         celltypes_indexes_0 = np.array(celltypes_indexes_0)
         # Now celltypes_indexes contains the numerical representation of cell types
-        #print(celltypes_indexes[:10]) # Example: print first 10 indexes
+        # print(celltypes_indexes[:10]) # Example: print first 10 indexes
 
-        perturbation_indexes_0 = [genotype_to_index[genotype] for genotype in perturbation_labels_0]
+        perturbation_indexes_0 = [
+            genotype_to_index[genotype] for genotype in perturbation_labels_0
+        ]
         perturbation_indexes_0 = np.array(perturbation_indexes_0)
 
         if adata is None:
             adata = adata_0.copy()
             next_counts = next_counts_0
             all_counts = all_counts_0
-            adata.layers[next_layer_key]=next_counts
+            adata.layers[next_layer_key] = next_counts
             genes = adata.var["gene_name"].tolist()
             celltypes_labels = celltypes_labels_0
             perturbation_labels = perturbation_labels_0
@@ -253,37 +329,49 @@ def produce_training_datasets(adata_input, config,
             num_batch_types = len(set(batch_ids))
             celltypes_indexes = celltypes_indexes_0
             perturbation_indexes = perturbation_indexes_0
-            #cell_ids = adata.obs.index.values
-            index_rounds = np.array([ni]*len(celltypes_labels_0))
+            # cell_ids = adata.obs.index.values
+            index_rounds = np.array([ni] * len(celltypes_labels_0))
         else:
-            adata_0.obs.index = adata_0.obs.index + "-r"+str(ni)
-            adata = adata.concatenate(adata_0,batch_key='batch_merged_rounds',index_unique=None)
-            
+            adata_0.obs.index = adata_0.obs.index + "-r" + str(ni)
+            adata = adata.concatenate(
+                adata_0, batch_key="batch_merged_rounds", index_unique=None
+            )
+
             next_counts = np.concatenate([next_counts, next_counts_0], axis=0)
             all_counts = np.concatenate([all_counts, all_counts_0], axis=0)
-            celltypes_labels = np.concatenate([celltypes_labels, celltypes_labels_0], axis=0)
-            perturbation_labels = np.concatenate([perturbation_labels, perturbation_labels_0], axis=0)
+            celltypes_labels = np.concatenate(
+                [celltypes_labels, celltypes_labels_0], axis=0
+            )
+            perturbation_labels = np.concatenate(
+                [perturbation_labels, perturbation_labels_0], axis=0
+            )
             batch_ids = np.concatenate([batch_ids, batch_ids_0], axis=0)
-            celltypes_indexes = np.concatenate([celltypes_indexes, celltypes_indexes_0], axis=0)
-            perturbation_indexes = np.concatenate([perturbation_indexes, perturbation_indexes_0], axis=0)
-            #cell_ids = np.concatenate([cell_ids, adata_0.obs.index.values],axis=0)
-            index_rounds = np.concatenate([index_rounds, np.array([ni]*len(celltypes_labels_0))], axis=0)
-            adata.obs['batch_merged_rounds'] = index_rounds
+            celltypes_indexes = np.concatenate(
+                [celltypes_indexes, celltypes_indexes_0], axis=0
+            )
+            perturbation_indexes = np.concatenate(
+                [perturbation_indexes, perturbation_indexes_0], axis=0
+            )
+            # cell_ids = np.concatenate([cell_ids, adata_0.obs.index.values],axis=0)
+            index_rounds = np.concatenate(
+                [index_rounds, np.array([ni] * len(celltypes_labels_0))], axis=0
+            )
+            adata.obs["batch_merged_rounds"] = index_rounds
 
         cell_ids = adata.obs.index.values
-            
-            # add next layers
+
+        # add next layers
 
         # or just duplicate the data
-        #next_counts = all_counts.copy()
+        # next_counts = all_counts.copy()
 
-        #next_counts = (adata.layers[next_layer_key].A if issparse(adata.layers[next_layer_key]) else adata.layers[next_layer_key])
+        # next_counts = (adata.layers[next_layer_key].A if issparse(adata.layers[next_layer_key]) else adata.layers[next_layer_key])
 
-        #print(perturbation_indexes[:10])
+        # print(perturbation_indexes[:10])
 
-    #n_cls = len(set(celltypes_labels)) if config.cell_type_classifier else 1
-    #n_cls
-    #n_perturb = len(set(perturbation_labels)) if config.perturbation_classifier_weight > 0 else 1
+    # n_cls = len(set(celltypes_labels)) if config.cell_type_classifier else 1
+    # n_cls
+    # n_perturb = len(set(perturbation_labels)) if config.perturbation_classifier_weight > 0 else 1
 
     # now, split train and test data
     (
@@ -298,19 +386,28 @@ def produce_training_datasets(adata_input, config,
         train_data_next,
         valid_data_next,
         cell_ids_train,
-        cell_ids_valid
+        cell_ids_valid,
     ) = train_test_split(
-        all_counts, celltypes_indexes, perturbation_indexes, batch_ids, next_counts, cell_ids, test_size=0.1, shuffle=True
+        all_counts,
+        celltypes_indexes,
+        perturbation_indexes,
+        batch_ids,
+        next_counts,
+        cell_ids,
+        test_size=0.1,
+        shuffle=True,
     )
 
-    adata.obs['is_in_training']=adata.obs.index.isin(cell_ids_train)
-    #adata_small=adata[adata.obs['is_in_training']==True] # only consider training data
-    adata_small=adata[adata.obs['is_in_training']==False] # only consider validation data
-    
-    #for ni in range(n_rounds):
+    adata.obs["is_in_training"] = adata.obs.index.isin(cell_ids_train)
+    # adata_small=adata[adata.obs['is_in_training']==True] # only consider training data
+    adata_small = adata[
+        adata.obs["is_in_training"] == False
+    ]  # only consider validation data
+
+    # for ni in range(n_rounds):
     #    print(f"round {ni}")
     #    adata_input_slice=adata_input[adata_input.obs.index.isin(adata_small.obs.index.values)]
-    #    
+    #
     #    round_next_c,adata_rets = add_pred_layer(adata_input_slice,next_cell_pred=next_cell_pred)
     #
     #    round_all_c = adata_small.layers[input_layer_key].copy()
@@ -318,11 +415,10 @@ def produce_training_datasets(adata_input, config,
     #    train_data = np.concatenate([train_data, round_all_c], axis=0)
     #    train_data_next = np.concatenate([train_data_next, round_next_c], axis=0)
 
-    #train_celltype_labels = np.concatenate([train_celltype_labels] * (n_rounds+1))
-    #train_perturbation_labels = np.concatenate([train_perturbation_labels] * (n_rounds+1))
-    #train_batch_labels = np.concatenate([train_batch_labels] * (n_rounds+1))
-    #cell_ids_train = np.concatenate([cell_ids_train] * (n_rounds + 1))
-
+    # train_celltype_labels = np.concatenate([train_celltype_labels] * (n_rounds+1))
+    # train_perturbation_labels = np.concatenate([train_perturbation_labels] * (n_rounds+1))
+    # train_batch_labels = np.concatenate([train_batch_labels] * (n_rounds+1))
+    # cell_ids_train = np.concatenate([cell_ids_train] * (n_rounds + 1))
 
     # prompt: shuffle the rows of all_counts and next_counts with the same order
 
@@ -338,18 +434,20 @@ def produce_training_datasets(adata_input, config,
     train_batch_labels = train_batch_labels[indices]
     cell_ids_train = cell_ids_train[indices]
 
-    if config.per_seq_batch_sample  and "batch_id" in adata.obs.columns: # and config.DSBN
+    if (
+        config.per_seq_batch_sample and "batch_id" in adata.obs.columns
+    ):  # and config.DSBN
         # sort the adata by batch_id in advance
-        #adata_sorted = adata[adata.obs["batch_id"].argsort()].copy()
-        #adata_sorted.obs
+        # adata_sorted = adata[adata.obs["batch_id"].argsort()].copy()
+        # adata_sorted.obs
         adata_sorted = adata_small[adata_small.obs["batch_id"].argsort()].copy()
     else:
-        #adata_sorted = adata.copy()
+        # adata_sorted = adata.copy()
         adata_sorted = adata_small.copy()
 
     # construct vocab
     vocab = Vocab(
-            VocabPybind(genes + config.special_tokens, None)
+        VocabPybind(genes + config.special_tokens, None)
     )  # bidirectional lookup [gene <-> int]
     vocab.set_default_index(vocab["<pad>"])
     gene_ids = np.array(vocab(genes), dtype=int)
@@ -406,55 +504,52 @@ def produce_training_datasets(adata_input, config,
             f"\n\t feature length: {tokenized_valid['genes'].shape[1]}"
         )
 
-
     # construct return value
-    ret_dict={
-        'adata': adata, # original adata
-        'adata_sorted': adata_sorted, # training adata
-        'vocab': vocab,
-        'n_perturb': n_perturb,
-        'n_cls': n_cls,
-        'genes': genes,
-        'gene_ids': gene_ids,
-        'num_batch_types': num_batch_types,
-        'cell_type_to_index': cell_type_to_index,
-        'genotype_to_index': genotype_to_index,
-        'train_data': train_data,
-        'valid_data': valid_data,
-        'train_data_next': train_data_next,
-        'valid_data_next': valid_data_next,
-        'train_celltype_labels': train_celltype_labels,
-        'valid_celltype_labels': valid_celltype_labels,
-        'train_perturbation_labels': train_perturbation_labels,
-        'valid_perturbation_labels': valid_perturbation_labels,
-        'train_batch_labels': train_batch_labels,
-        'valid_batch_labels': valid_batch_labels,
-        'cell_ids_train': cell_ids_train,
-        'cell_ids_valid': cell_ids_valid,
-        'tokenized_train': tokenized_train,
-        'tokenized_valid': tokenized_valid,
-        'tokenized_train_next': tokenized_train_next,
-        'tokenized_valid_next': tokenized_valid_next,
+    ret_dict = {
+        "adata": adata,  # original adata
+        "adata_sorted": adata_sorted,  # training adata
+        "vocab": vocab,
+        "n_perturb": n_perturb,
+        "n_cls": n_cls,
+        "genes": genes,
+        "gene_ids": gene_ids,
+        "num_batch_types": num_batch_types,
+        "cell_type_to_index": cell_type_to_index,
+        "genotype_to_index": genotype_to_index,
+        "train_data": train_data,
+        "valid_data": valid_data,
+        "train_data_next": train_data_next,
+        "valid_data_next": valid_data_next,
+        "train_celltype_labels": train_celltype_labels,
+        "valid_celltype_labels": valid_celltype_labels,
+        "train_perturbation_labels": train_perturbation_labels,
+        "valid_perturbation_labels": valid_perturbation_labels,
+        "train_batch_labels": train_batch_labels,
+        "valid_batch_labels": valid_batch_labels,
+        "cell_ids_train": cell_ids_train,
+        "cell_ids_valid": cell_ids_valid,
+        "tokenized_train": tokenized_train,
+        "tokenized_valid": tokenized_valid,
+        "tokenized_train_next": tokenized_train_next,
+        "tokenized_valid_next": tokenized_valid_next,
     }
     return ret_dict
 
-def prepare_data(
-    data_dict,
-    config,
-    sort_seq_batch=False,
-    epoch = 0) -> Tuple[Dict[str, torch.Tensor]]:
 
+def prepare_data(
+    data_dict, config, sort_seq_batch=False, epoch=0
+) -> Tuple[Dict[str, torch.Tensor]]:
     # extract data
-    tokenized_train=data_dict['tokenized_train']
-    tokenized_valid=data_dict['tokenized_valid']
-    tokenized_train_next=data_dict['tokenized_train_next']
-    tokenized_valid_next=data_dict['tokenized_valid_next']
-    train_batch_labels=data_dict['train_batch_labels']
-    valid_batch_labels=data_dict['valid_batch_labels']
-    train_celltype_labels=data_dict['train_celltype_labels']
-    valid_celltype_labels=data_dict['valid_celltype_labels']
-    train_perturbation_labels=data_dict['train_perturbation_labels']
-    valid_perturbation_labels=data_dict['valid_perturbation_labels']
+    tokenized_train = data_dict["tokenized_train"]
+    tokenized_valid = data_dict["tokenized_valid"]
+    tokenized_train_next = data_dict["tokenized_train_next"]
+    tokenized_valid_next = data_dict["tokenized_valid_next"]
+    train_batch_labels = data_dict["train_batch_labels"]
+    valid_batch_labels = data_dict["valid_batch_labels"]
+    train_celltype_labels = data_dict["train_celltype_labels"]
+    valid_celltype_labels = data_dict["valid_celltype_labels"]
+    train_perturbation_labels = data_dict["train_perturbation_labels"]
+    valid_perturbation_labels = data_dict["valid_perturbation_labels"]
 
     masked_values_train = random_mask_value(
         tokenized_train["values"],
@@ -482,7 +577,7 @@ def prepare_data(
         tokenized_train["values"],
         tokenized_valid["values"],
     )
-    target_values_train_next, target_values_valid_next = ( # added
+    target_values_train_next, target_values_valid_next = (  # added
         tokenized_train_next["values"],
         tokenized_valid_next["values"],
     )
@@ -490,49 +585,64 @@ def prepare_data(
     tensor_batch_labels_train = torch.from_numpy(train_batch_labels).long()
     tensor_batch_labels_valid = torch.from_numpy(valid_batch_labels).long()
 
+    tensor_celltype_labels_train = torch.from_numpy(
+        train_celltype_labels
+    ).long()  # added
+    tensor_celltype_labels_valid = torch.from_numpy(
+        valid_celltype_labels
+    ).long()  # added
 
-    tensor_celltype_labels_train = torch.from_numpy(train_celltype_labels).long()#added
-    tensor_celltype_labels_valid = torch.from_numpy(valid_celltype_labels).long()#added
-
-    tensor_perturbation_labels_train = torch.from_numpy(train_perturbation_labels).long()#added
-    tensor_perturbation_labels_valid = torch.from_numpy(valid_perturbation_labels).long()#added
+    tensor_perturbation_labels_train = torch.from_numpy(
+        train_perturbation_labels
+    ).long()  # added
+    tensor_perturbation_labels_valid = torch.from_numpy(
+        valid_perturbation_labels
+    ).long()  # added
 
     if sort_seq_batch:
         train_sort_ids = np.argsort(train_batch_labels)
         input_gene_ids_train = input_gene_ids_train[train_sort_ids]
         input_values_train = input_values_train[train_sort_ids]
         target_values_train = target_values_train[train_sort_ids]
-        target_values_train_next = target_values_train_next[train_sort_ids] # added
+        target_values_train_next = target_values_train_next[train_sort_ids]  # added
         tensor_batch_labels_train = tensor_batch_labels_train[train_sort_ids]
-        tensor_celltype_labels_train = tensor_celltype_labels_train[train_sort_ids]#added
-        tensor_perturbation_labels_train = tensor_perturbation_labels_train[train_sort_ids]#added
+        tensor_celltype_labels_train = tensor_celltype_labels_train[
+            train_sort_ids
+        ]  # added
+        tensor_perturbation_labels_train = tensor_perturbation_labels_train[
+            train_sort_ids
+        ]  # added
 
         valid_sort_ids = np.argsort(valid_batch_labels)
         input_gene_ids_valid = input_gene_ids_valid[valid_sort_ids]
         input_values_valid = input_values_valid[valid_sort_ids]
         target_values_valid = target_values_valid[valid_sort_ids]
-        target_values_valid_next = target_values_valid_next[valid_sort_ids] # added
+        target_values_valid_next = target_values_valid_next[valid_sort_ids]  # added
         tensor_batch_labels_valid = tensor_batch_labels_valid[valid_sort_ids]
-        tensor_celltype_labels_valid = tensor_celltype_labels_valid[valid_sort_ids] #added
-        tensor_perturbation_labels_valid = tensor_perturbation_labels_valid[valid_sort_ids] #added
+        tensor_celltype_labels_valid = tensor_celltype_labels_valid[
+            valid_sort_ids
+        ]  # added
+        tensor_perturbation_labels_valid = tensor_perturbation_labels_valid[
+            valid_sort_ids
+        ]  # added
 
     train_data_pt = {
         "gene_ids": input_gene_ids_train,
         "values": input_values_train,
         "target_values": target_values_train,
-        "target_values_next": target_values_train_next, # added
+        "target_values_next": target_values_train_next,  # added
         "batch_labels": tensor_batch_labels_train,
-        "celltype_labels": tensor_celltype_labels_train, #added
-        "perturbation_labels": tensor_perturbation_labels_train, #added
+        "celltype_labels": tensor_celltype_labels_train,  # added
+        "perturbation_labels": tensor_perturbation_labels_train,  # added
     }
     valid_data_pt = {
         "gene_ids": input_gene_ids_valid,
         "values": input_values_valid,
         "target_values": target_values_valid,
-        "target_values_next": target_values_valid_next, # added
+        "target_values_next": target_values_valid_next,  # added
         "batch_labels": tensor_batch_labels_valid,
-        "celltype_labels": tensor_celltype_labels_valid, #added
-        "perturbation_labels": tensor_perturbation_labels_valid, #added
+        "celltype_labels": tensor_celltype_labels_valid,  # added
+        "perturbation_labels": tensor_perturbation_labels_valid,  # added
     }
 
     return train_data_pt, valid_data_pt
@@ -592,5 +702,3 @@ def prepare_dataloader(
         pin_memory=True,
     )
     return data_loader
-
-

@@ -1,0 +1,5 @@
+scgpt
+*.h5ad
+wandb
+save
+*__pycache__*
